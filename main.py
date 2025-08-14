@@ -141,7 +141,8 @@ if BULLETIN_CHANNEL_ID is None:
 # Discord Bot Setup
 # =============================
 intents = discord.Intents.default()
-intents.message_content = False  # not needed for DMs via on_message? We'll use on_message for DMs -> requires message_content for DMs
+# Needed to read user DMs for relaying check-ins
+intents.message_content = True
 intents.members = True
 intents.dm_messages = True
 intents.messages = True
@@ -471,6 +472,8 @@ async def revoke(interaction: discord.Interaction, user: discord.User):
 # =============================
 # Run bot
 # =============================
+# Tip: Discord Developer Portal → Bot → Privileged Gateway Intents → enable Message Content + Server Members
+
 if __name__ == "__main__":
     try:
         bot.run(TOKEN)

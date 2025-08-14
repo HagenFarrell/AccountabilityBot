@@ -1,0 +1,14 @@
+# nixpacks.toml
+[phases.setup]
+# Make sure we have Python 3 + gcc at build time
+nixPkgs = ["python3", "gcc"]
+
+[phases.install]
+# Nixpacks already creates a venv and activates it for this phase.
+cmds = [
+  "python -m pip install --upgrade pip",
+  "pip install --no-cache-dir -r requirements.txt"
+]
+
+[start]
+cmd = "python main.py"

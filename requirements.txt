@@ -1,7 +1,7 @@
-py-cord==2.4.0
+discord.py==2.4.0
 APScheduler==3.10.4
 
-# Avoid compiling C extensions
+# keep wheels-friendly pins to avoid compiling
 aiohttp==3.9.5
 multidict==6.0.5
 yarl==1.9.4

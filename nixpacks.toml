@@ -1,0 +1,16 @@
+# nixpacks.toml  (put in repo root)
+[phases.setup]
+# pick an explicit Python; 3.11 has wheels for aiohttp/discord.py
+nixPkgs = ["python311", "gcc", "openssl", "libffi", "zlib"]
+
+[phases.install]
+# create our own venv and use absolute paths so we don't rely on shell activation
+cmds = [
+  "python -m venv --copies /opt/venv",
+  "/opt/venv/bin/python -m ensurepip --upgrade",
+  "/opt/venv/bin/pip install --upgrade pip wheel setuptools",
+  "/opt/venv/bin/pip install --no-cache-dir -r requirements.txt"
+]
+
+[start]
+cmd = "/opt/venv/bin/python main.py"

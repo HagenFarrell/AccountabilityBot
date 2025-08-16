@@ -250,17 +250,21 @@ async def reschedule_all():
 # =============================
 @bot.event
 async def on_ready():
-    # Sync commands to a specific guild for faster availability if provided
+    # Global sync (harmless; helps if you later want global commands)
     try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            await bot.tree.sync(guild=guild)
-        else:
-            await bot.tree.sync()
+        await bot.tree.sync()
+        print("Synced global commands.")
     except Exception as e:
-        print("Command sync error:", e)
+        print("Global sync error:", e)
 
-    # Start scheduler
+    # Force-sync to each guild we actually share (instant appearance)
+    for g in bot.guilds:
+        try:
+            await bot.tree.sync(guild=g)
+            print(f"Synced commands to guild {g.name} ({g.id})")
+        except Exception as e:
+            print(f"Guild sync error for {g.id}: {e}")
+
     if not scheduler.running:
         scheduler.start()
         await reschedule_all()

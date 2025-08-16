@@ -154,20 +154,29 @@ user_jobs: dict[int, str] = {}  # user_id -> job id
 # =============================
 # Utilities
 # =============================
-
+ADMIN_ROLE_NAME="Check-In Bot Admin"
 def is_admin(interaction: discord.Interaction) -> bool:
-    """Check if the invoker is an admin (has Manage Guild) or has ADMIN_ROLE_ID if set."""
+    """Admin if user has Manage Guild/Admin perms, or matches ADMIN_ROLE_ID / ADMIN_ROLE_NAME."""
     user = interaction.user
     if isinstance(user, discord.Member):
+        # Native perms first
         if user.guild_permissions.manage_guild or user.guild_permissions.administrator:
             return True
+        # Role by ID
         if ADMIN_ROLE_ID:
             try:
                 admin_role_id = int(ADMIN_ROLE_ID)
-                return any(r.id == admin_role_id for r in user.roles)
+                if any(r.id == admin_role_id for r in user.roles):
+                    return True
             except ValueError:
-                return False
+                pass
+        # Role by name (case-insensitive)
+        if ADMIN_ROLE_NAME:
+            target = ADMIN_ROLE_NAME.strip().lower()
+            if any(r.name.lower() == target for r in user.roles):
+                return True
     return False
+
 
 
 def valid_hhmm(value: str) -> bool:
@@ -274,25 +283,24 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Allow other cogs/listeners
-    await bot.process_commands(message)
-
-    # Only handle DMs from users (not bots)
+    # Ignore bots
     if message.author.bot:
         return
+
+    # --- DM handling first ---
     if isinstance(message.channel, discord.DMChannel):
         member = db.get_member(message.author.id)
         if not member or member.get("approved") != 1:
             try:
                 await message.channel.send(
-                    "Hey! You are not on the approved list for this accountability bot.\n"
-                    "Please ask a group leader to approve you first."
+                    "You're not enrolled yet. Use **/join** in the server to opt into daily check-ins.\n"
+                    "After joining, set your time with **/settime** and timezone with **/settimezone**."
                 )
             except discord.Forbidden:
                 pass
-            return
+            return  # end DM path cleanly
 
-        content = message.content.strip()
+        content = (message.content or "").strip()
         if not content:
             return
 
@@ -310,8 +318,8 @@ async def on_message(message: discord.Message):
                 pass
             return
 
-        # Compose a safe, clean message
         author_name = message.author.global_name or message.author.display_name or message.author.name
+        member = db.get_member(message.author.id)  # refresh in case tz changed
         now_local = datetime.now(tz=timezone.utc).astimezone(ZoneInfo(member["tz"]))
         embed = discord.Embed(
             title="Daily Check-in",
@@ -329,6 +337,10 @@ async def on_message(message: discord.Message):
                 await message.channel.send("Sorry, I couldn't post to the bulletin channel.")
             except discord.Forbidden:
                 pass
+        return  # end DM path
+
+    # --- Non-DM messages go to command processor ---
+    await bot.process_commands(message)
 
 
 # =============================
@@ -353,7 +365,8 @@ async def mysettings(interaction: discord.Interaction):
     member = db.get_member(interaction.user.id)
     if not member or member.get("approved") != 1:
         await interaction.response.send_message(
-            "You are not approved yet. Ask a leader to run /approve on you.", ephemeral=True
+            "You're not enrolled. Use **/join** to start, then **/settimezone** and **/settime**.",
+            ephemeral=True
         )
         return
     await interaction.response.send_message(
@@ -411,6 +424,37 @@ async def settimezone(interaction: discord.Interaction, tz: str):
         f"✅ Timezone set to **{tz}**. Your daily DM is at **{member['hhmm']}** local time.",
         ephemeral=True,
     )
+
+@guild_scope()
+@bot.tree.command(name="join", description="Opt-in to daily check-ins for this server")
+async def join(interaction: discord.Interaction):
+    existing = db.get_member(interaction.user.id)
+    tz = existing["tz"] if existing else DEFAULT_TZ
+    hhmm = existing["hhmm"] if existing else "08:00"
+    db.upsert_member(interaction.user.id, tz, hhmm, approved=1)
+    await schedule_for_member(interaction.user.id, tz, hhmm)
+    await interaction.response.send_message(
+        "✅ You're in! I'll DM you each day. Use **/settimezone** and **/settime** to customize.",
+        ephemeral=True,
+    )
+
+
+@guild_scope()
+@bot.tree.command(name="leave", description="Opt-out so your DMs won't be posted anymore")
+async def leave(interaction: discord.Interaction):
+    m = db.get_member(interaction.user.id)
+    if not m or m.get("approved") != 1:
+        await interaction.response.send_message("You're not enrolled.", ephemeral=True)
+        return
+    db.approve_member(interaction.user.id, 0)
+    job_id = user_jobs.get(interaction.user.id)
+    if job_id:
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+        user_jobs.pop(interaction.user.id, None)
+    await interaction.response.send_message("✅ Unsubscribed. You can **/join** again anytime.", ephemeral=True)
 
 
 # ---- Admin Commands ----

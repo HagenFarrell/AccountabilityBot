@@ -32,6 +32,7 @@ class DB:
         self.path = path
         self._init()
 
+
     def _connect(self):
         return sqlite3.connect(self.path)
 
@@ -68,7 +69,46 @@ class DB:
                 """
             )
             conn.commit()
+        self._ensure_columns()
 
+    def _ensure_columns(self):
+        """Lightweight migrations: add columns if they don't exist yet."""
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(members)")
+            cols = {row[1] for row in cur.fetchall()}
+            if "cadence" not in cols:
+                cur.execute("ALTER TABLE members ADD COLUMN cadence TEXT NOT NULL DEFAULT 'daily'")
+            if "dow" not in cols:
+                cur.execute("ALTER TABLE members ADD COLUMN dow TEXT")  # mon..sun or NULL
+            conn.commit()
+    
+    def set_member_cadence(self, user_id: int, cadence: str, dow: str | None):
+        with self._connect() as conn:
+            conn.execute("UPDATE members SET cadence=?, dow=? WHERE user_id=?", (cadence, dow, user_id))
+            conn.commit()
+
+    def get_member_full(self, user_id: int):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT user_id, tz, hhmm, approved, cadence, dow FROM members WHERE user_id=?",
+                (user_id,)
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "user_id": row[0], "tz": row[1], "hhmm": row[2],
+                "approved": row[3], "cadence": row[4], "dow": row[5]
+            }
+
+    def get_active_members_full(self):
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id, tz, hhmm, cadence, dow FROM members WHERE approved=1"
+            ).fetchall()
+            return [{"user_id": r[0], "tz": r[1], "hhmm": r[2], "cadence": r[3], "dow": r[4]} for r in rows]
+
+    
     # Settings
     def get_setting(self, key: str):
         with self._connect() as conn:
@@ -209,9 +249,18 @@ async def get_bulletin_channel() -> discord.TextChannel | None:
     return None
 
 
-async def schedule_for_member(user_id: int, tz: str, hhmm: str):
-    """Schedule (or reschedule) a per-user daily DM job at their local hh:mm."""
-    # Remove previous job if exists
+def _norm_dow(d: str | None) -> str | None:
+    if not d:
+        return None
+    d = d.strip().lower()
+    alias = {
+        "monday":"mon","tuesday":"tue","wednesday":"wed","thursday":"thu","friday":"fri","saturday":"sat","sunday":"sun",
+        "mon":"mon","tue":"tue","wed":"wed","thu":"thu","fri":"fri","sat":"sat","sun":"sun"
+    }
+    return alias.get(d)
+
+async def schedule_for_member(user_id: int, tz: str, hhmm: str, cadence: str = "daily", dow: str | None = None):
+    # remove existing
     job_id = user_jobs.get(user_id)
     if job_id:
         try:
@@ -219,14 +268,21 @@ async def schedule_for_member(user_id: int, tz: str, hhmm: str):
         except Exception:
             pass
 
-    # Create new job
     hour, minute = map(int, hhmm.split(":"))
     try:
         tzinfo = ensure_zoneinfo(tz)
     except ValueError:
         tzinfo = ensure_zoneinfo(DEFAULT_TZ)
 
-    trigger = CronTrigger(hour=hour, minute=minute, timezone=tzinfo)
+    trig_kwargs = {"hour": hour, "minute": minute, "timezone": tzinfo}
+    if (cadence or "daily").lower() == "weekly":
+        nd = _norm_dow(dow or "")
+        if not nd:
+            # fallback: default weekly on user's tz Monday
+            nd = "mon"
+        trig_kwargs["day_of_week"] = nd
+
+    trigger = CronTrigger(**trig_kwargs)
     job = scheduler.add_job(send_daily_prompt_to_user, trigger=trigger, args=[user_id], id=f"dm_{user_id}")
     user_jobs[user_id] = job.id
 
@@ -249,9 +305,8 @@ async def send_daily_prompt_to_user(user_id: int):
 
 
 async def reschedule_all():
-    members = db.get_approved_members()
-    for user_id, tz, hhmm in members:
-        await schedule_for_member(user_id, tz, hhmm)
+    for m in db.get_active_members_full():
+        await schedule_for_member(m["user_id"], m["tz"], m["hhmm"], m["cadence"], m["dow"])
 
 
 # =============================
@@ -376,6 +431,48 @@ async def mysettings(interaction: discord.Interaction):
 
 
 @guild_scope()
+@bot.tree.command(name="setcadence", description="Choose daily or weekly check-ins")
+@app_commands.describe(mode="daily or weekly")
+async def setcadence(interaction: discord.Interaction, mode: str):
+    mode_l = (mode or "").strip().lower()
+    if mode_l not in {"daily","weekly"}:
+        await interaction.response.send_message("Use `daily` or `weekly`.", ephemeral=True)
+        return
+    m = db.get_member_full(interaction.user.id)
+    if not m or m["approved"] != 1:
+        await interaction.response.send_message("You're not enrolled. Use **/join** first.", ephemeral=True)
+        return
+    db.set_member_cadence(interaction.user.id, mode_l, m["dow"] if mode_l=="weekly" else None)
+    # reschedule
+    m = db.get_member_full(interaction.user.id)
+    await schedule_for_member(m["user_id"], m["tz"], m["hhmm"], m["cadence"], m["dow"])
+    await interaction.response.send_message(f"✅ Cadence set to **{mode_l}**.", ephemeral=True)
+
+
+@guild_scope()
+@bot.tree.command(name="setweekly", description="Set your weekly day and time for check-ins")
+@app_commands.describe(day="mon..sun or full name", hhmm="24h time like 07:30")
+async def setweekly(interaction: discord.Interaction, day: str, hhmm: str):
+    if not valid_hhmm(hhmm):
+        await interaction.response.send_message("Time must be HH:MM (24-hour).", ephemeral=True)
+        return
+    day_norm = _norm_dow(day)
+    if not day_norm:
+        await interaction.response.send_message("Day must be one of mon..sun (or full name).", ephemeral=True)
+        return
+    m = db.get_member_full(interaction.user.id)
+    if not m or m["approved"] != 1:
+        await interaction.response.send_message("You're not enrolled. Use **/join** first.", ephemeral=True)
+        return
+    # update both hhmm and cadence/dow
+    db.set_member_time(interaction.user.id, hhmm)
+    db.set_member_cadence(interaction.user.id, "weekly", day_norm)
+    m = db.get_member_full(interaction.user.id)
+    await schedule_for_member(m["user_id"], m["tz"], m["hhmm"], m["cadence"], m["dow"])
+    await interaction.response.send_message(f"✅ Weekly check-in set: **{day_norm} {hhmm}**.", ephemeral=True)
+
+
+@guild_scope()
 @bot.tree.command(name="settime", description="Set the daily DM time (HH:MM in 24h format)")
 @app_commands.describe(hhmm="Time like 07:30 or 21:05")
 async def settime(interaction: discord.Interaction, hhmm: str):
@@ -432,6 +529,7 @@ async def join(interaction: discord.Interaction):
     tz = existing["tz"] if existing else DEFAULT_TZ
     hhmm = existing["hhmm"] if existing else "08:00"
     db.upsert_member(interaction.user.id, tz, hhmm, approved=1)
+    db.set_member_cadence(interaction.user.id, "daily", None)
     await schedule_for_member(interaction.user.id, tz, hhmm)
     await interaction.response.send_message(
         "✅ You're in! I'll DM you each day. Use **/settimezone** and **/settime** to customize.",
